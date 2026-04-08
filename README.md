@@ -1,2 +1,1014 @@
 # The-G-Nexus-Utsira-Project
 The G-Nexus Utsira Project ENP project
+"""
+=============================================================================
+  G-Nexus Utsira Alpha — Hourly Energy Balance Simulation
+  ENP120 Energy Technology | Spring 2026
+=============================================================================
+  Simulates a full year (8760 hours) of:
+    - Demand: residential, industrial (salmon plant, water/sanitation),
+              EV charging, local businesses, data center
+    - Supply: offshore wind + solar PV
+    - Storage: battery bank (covers 48-hr Dunkelflaute for DC + emergency)
+    - Optional: district heating loop (bonus Task 3)
+
+  USAGE
+  -----
+  1. Place your data-center CSV in the same folder as this script.
+     Set DATA_CENTER_CSV to the filename (see CONFIGURATION below).
+  2. Run:  python utsira_simulation.py
+  3. Output plots are saved to ./plots/
+
+  NOTE: All load values are engineering estimates based on published
+  Norwegian/Scandinavian references. YOU must verify them against
+  authoritative sources before submitting (per AI Audit requirement).
+=============================================================================
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import json
+try:
+    import requests
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests",
+                           "--break-system-packages", "-q"])
+    import requests
+
+# ── Make output folder ────────────────────────────────────────────────────────
+os.makedirs("plots", exist_ok=True)
+
+# =============================================================================
+# CONFIGURATION  ← edit these values to match your verified research data
+# =============================================================================
+
+DATA_CENTER_CSV = "/sessions/exciting-adoring-volta/mnt/uploads/The G-Nexus Data Center_Updated.csv"
+# Columns: timestamp, it_electrical_load_kw, cooling_thermal_load_kw, waste_heat_available_kw
+# Data is at 30-min resolution — resampled to hourly below.
+
+# ── Utsira location (Open-Meteo / ERA5) ──────────────────────────────────────
+UTSIRA_LAT       = 59.3085
+UTSIRA_LON       = 4.8827
+WEATHER_YEAR     = 2024          # ERA5 historical year to fetch
+WEATHER_CACHE    = "utsira_weather_cache.json"   # saved locally to avoid re-fetching
+
+# =============================================================================
+# ── LOAD DATA SOURCES ────────────────────────────────────────────────────────
+#
+#  ┌─────────────────────────────────────────────────────────────────────────┐
+#  │  RESIDENTIAL                                                            │
+#  │  Source: SSB Tabell "Energibruk i husholdningene" (husenergi), 2022    │
+#  │  Methodology: Elhub-linked electricity data for all Norwegian           │
+#  │  households. Published 2024-12-18.                                      │
+#  │  URL: https://www.ssb.no/en/energi-og-industri/energi/statistikk/      │
+#  │       energibruk-i-husholdningene                                       │
+#  │                                                                         │
+#  │  Key figures (national averages, 2022):                                 │
+#  │    Detached house  : 25 776 kWh/year                                    │
+#  │    Terraced house  : 17 090 kWh/year                                    │
+#  │    Apartment       : 10 899 kWh/year                                    │
+#  │                                                                         │
+#  │  Utsira: predominantly detached houses → use 25 776 kWh/HH             │
+#  │                                                                         │
+#  │  Number of households: SSB KOSTRA Utsira/bolig                         │
+#  │  URL: https://www.ssb.no/kommunefakta/kostra/utsira/bolig               │
+#  │  Population 219 / avg 2.07 persons/HH (SSB 2023) ≈ 106 husstander      │
+#  │  !! YOU MUST verify the exact household count from SSB KOSTRA !!        │
+#  │                                                                         │
+#  │  Winter/Summer ratio: SSB reports Jan ≈ 2.4× July for Norwegian        │
+#  │  detached houses with electric heating (Elhub monthly data 2022)        │
+#  │                                                                         │
+#  │  MUNICIPAL ENERGY ACCOUNT: For the total verified Utsira consumption   │
+#  │  figure, also check NVE Kommunefordelt energiregnskap:                  │
+#  │  URL: https://www.nve.no/energi/energisystem/energibruk/               │
+#  │       energibruk-i-kommuner/                                            │
+#  └─────────────────────────────────────────────────────────────────────────┘
+#
+#  ┌─────────────────────────────────────────────────────────────────────────┐
+#  │  INDUSTRY — Salmon processing                                           │
+#  │  Source: Nofima rapport "Energibruk i norsk fiskeindustri"              │
+#  │  SEC (Specific Energy Consumption) for chilled/frozen salmon:           │
+#  │    Refrigeration + freezing: 200–500 kWh/tonne (typical 300–400)       │
+#  │  Reference: Nofima / FAO Fisheries Technical Paper 520 (2010)          │
+#  │  URL: https://www.fao.org/3/i1634e/i1634e.pdf                          │
+#  │  !! YOU MUST verify the exact SEC for the specific plant type !!        │
+#  │                                                                         │
+#  │  INDUSTRY — Water & sanitation                                          │
+#  │  Source: VA-norm / Norsk Vann rapport B22 (2022)                       │
+#  │  Typical: 0.5–1.0 kWh per m³ water produced for small municipalities   │
+#  │  For 219 persons × 150 L/day → ~33 000 m³/year → ~30 kW continuous    │
+#  └─────────────────────────────────────────────────────────────────────────┘
+# =============================================================================
+
+# ── Island basics ─────────────────────────────────────────────────────────────
+# Source: SSB Kommunefakta Utsira / Wikipedia
+# URL: https://www.ssb.no/kommunefakta/utsira
+PERSONS            = 219          # SSB 2024 population
+N_HOUSEHOLDS       = 106          # Estimated: 219 / 2.07 persons per HH (SSB avg)
+                                  # !! VERIFY exact number from SSB KOSTRA !!
+
+# ── Residential load parameters ───────────────────────────────────────────────
+# Source: SSB "Energibruk i husholdningene" 2022, via Elhub data
+# URL: https://www.ssb.no/en/energi-og-industri/energi/statistikk/energibruk-i-husholdningene
+# Utsira = predominantly detached houses with electric heating → 25 776 kWh/HH
+ANNUAL_kWh_PER_HH   = 25_776     # kWh/year — SSB 2022 detached house national avg
+WINTER_SUMMER_RATIO = 2.4        # Jan/Jul ratio — SSB Elhub monthly data 2022
+DAILY_PEAK_HOUR     = 18         # Evening peak — consistent with Statnett load data
+
+# ── Salmon processing plant ───────────────────────────────────────────────────
+# Source: FAO Fisheries Technical Paper 520 / Nofima energy reports
+# SEC range: 200–500 kWh/tonne; using 350 kWh/tonne (midpoint, chilled+frozen)
+# URL: https://www.fao.org/3/i1634e/i1634e.pdf   (Table 9, p.68)
+# !! VERIFY against specific plant at Utsira !!
+SALMON_TONS_PER_YEAR   = 500     # tonnes/year — scaled to island community size
+SALMON_SEC_kWh_PER_TON = 350     # kWh/tonne (refrigeration + freezing)
+SALMON_OPERATING_HOURS = 6_000   # operating hours/year (5-day week, 2-shift)
+
+# ── Water & sanitation ────────────────────────────────────────────────────────
+# Source: Norsk Vann rapport B22/2022 — energy in water & wastewater
+# ~0.8 kWh/m³ × 219 persons × 150 L/day × 365 days / 8760 h ≈ 30 kW avg
+# URL: https://www.norskvann.no/
+WATER_SANITATION_kW = 30         # kW continuous equivalent (updated from 25 kW)
+
+# ── EV charging ───────────────────────────────────────────────────────────────
+# Source: Assignment specification (200 charging points required)
+N_CHARGING_POINTS      = 200
+EV_CHARGER_kW          = 7.4     # kW per point — standard IEC 62196 Type 2 AC
+EV_EVENING_START_HOUR  = 17      # peak charging window start
+EV_EVENING_END_HOUR    = 21      # peak charging window end
+EV_SIMULTANEOUS_FACTOR = 0.35    # simultaneous factor — Enova EV-rapport 2023
+
+# ── Local businesses ──────────────────────────────────────────────────────────
+# Source: Enova "Energibruk i tjenesteytende sektor" 2022
+# Small island commercial: café, guesthouse, shop, lighthouse, harbour office
+# URL: https://www.enova.no/om-enova/energisystemet/
+BUSINESS_PEAK_kW       = 80      # kW peak across all businesses (island scale)
+BUSINESS_OPERATING_HRS = 10      # hours/day (08:00–18:00)
+
+# ── Renewable generation ──────────────────────────────────────────────────────
+# Wind — offshore/coastal turbines (Utsira is famous for its wind resource)
+WIND_INSTALLED_MW      = 4.0     # MW total installed  (YOU must justify this)
+WIND_CAPACITY_FACTOR   = 0.45    # annual CF for North Sea location (verify: EMD/ERA5)
+
+# Solar PV — limited at 59°N but still viable as supplement
+SOLAR_INSTALLED_MW     = 0.5     # MW total installed  (YOU must justify this)
+SOLAR_CAPACITY_FACTOR  = 0.12    # annual CF for 59°N (verify: PVGIS / JRC)
+
+# ── Battery storage ───────────────────────────────────────────────────────────
+BATTERY_DUNKELFLAUTE_HRS = 48    # hours to cover with zero wind/solar
+# Battery capacity is CALCULATED in the simulation from DC + emergency loads
+
+# ── Data center ───────────────────────────────────────────────────────────────
+DC_RATED_MW            = 1.0     # MW (given)
+
+# =============================================================================
+# HELPER: build hourly shape arrays  (indices 0–8759)
+# =============================================================================
+
+def build_hourly_index():
+    """Return a DatetimeIndex for a non-leap year."""
+    return pd.date_range("2025-01-01", periods=8760, freq="h")
+
+
+def month_weight(dti):
+    """
+    Return a per-hour seasonal weight so that the year-average is 1.0
+    and January is WINTER_SUMMER_RATIO times higher than July.
+    Smooth sinusoidal model.
+    """
+    # day-of-year fraction  0→1
+    doy_frac = np.array((dti.dayofyear - 1) / 365.0)
+    # cosine peaks in January (day 1) and troughs in July (day 182)
+    amplitude = (WINTER_SUMMER_RATIO - 1) / (WINTER_SUMMER_RATIO + 1)
+    weight = 1 + amplitude * np.cos(2 * np.pi * doy_frac)
+    # Normalize so the annual mean equals 1.0
+    weight = weight / weight.mean()
+    return weight
+
+
+def daily_shape(dti):
+    """
+    Normalised daily load shape for households.
+    Peak at DAILY_PEAK_HOUR, low at 03:00.
+    Simple trapezoid / cosine approximation.
+    """
+    hour = np.array(dti.hour)
+    # two-cosine model: overnight trough + evening peak
+    shape = (
+        0.6
+        + 0.2 * np.cos(2 * np.pi * (hour - 3) / 24)        # overnight low at 03:00
+        - 0.2 * np.cos(2 * np.pi * (hour - DAILY_PEAK_HOUR) / 24)  # evening peak
+    )
+    return shape / shape.mean()   # normalise mean = 1
+
+
+# =============================================================================
+# PHASE 1 — DEMAND
+# =============================================================================
+
+def build_residential_load(dti):
+    """Hourly residential load in kW for all households."""
+    annual_kWh_total = N_HOUSEHOLDS * ANNUAL_kWh_PER_HH
+    avg_kW = annual_kWh_total / 8760
+
+    seasonal = month_weight(dti)
+    diurnal  = daily_shape(dti)
+    profile_kW = avg_kW * seasonal * diurnal
+    return pd.Series(profile_kW, index=dti)
+
+
+def build_salmon_load(dti):
+    """
+    Flat load during operating hours (weekdays 06:00–18:00 as proxy).
+    Seasonal: heavier in autumn/winter harvest season.
+    """
+    annual_kWh = SALMON_TONS_PER_YEAR * SALMON_SEC_kWh_PER_TON
+    avg_operating_kW = annual_kWh / SALMON_OPERATING_HOURS
+
+    # Operating window: 06:00–18:00, Mon–Fri
+    operating = (
+        (np.array(dti.hour) >= 6) & (np.array(dti.hour) < 18) &
+        (np.array(dti.dayofweek) < 5)  # 0=Mon … 4=Fri
+    ).astype(float)
+
+    # Seasonal boost: ~30% higher Oct–Jan (harvest season)
+    month = np.array(dti.month)
+    seasonal_boost = np.where((month >= 10) | (month <= 1), 1.3, 1.0)
+
+    raw = operating * avg_operating_kW * seasonal_boost
+    # Rescale so annual total matches target
+    if raw.sum() > 0:
+        raw *= annual_kWh / raw.sum()
+    return raw
+
+
+def build_water_sanitation_load(dti):
+    """Near-constant load with small daytime increase."""
+    diurnal = 0.9 + 0.1 * np.clip(np.sin(np.pi * (np.array(dti.hour) - 6) / 12), 0, 1)
+    return pd.Series(WATER_SANITATION_kW * diurnal, index=dti)
+
+
+def build_ev_load(dti):
+    """Evening charging spike."""
+    peak_kW = N_CHARGING_POINTS * EV_CHARGER_kW * EV_SIMULTANEOUS_FACTOR
+    in_window = (
+        (np.array(dti.hour) >= EV_EVENING_START_HOUR) &
+        (np.array(dti.hour) < EV_EVENING_END_HOUR)
+    ).astype(float)
+    # Slightly higher on weekdays
+    weekday_boost = np.where(np.array(dti.dayofweek) < 5, 1.0, 0.7)
+    return pd.Series(peak_kW * in_window * weekday_boost, index=dti)
+
+
+def build_business_load(dti):
+    """Flat load during business hours."""
+    in_hours = (
+        (np.array(dti.hour) >= 😎 & (np.array(dti.hour) < 18) &
+        (np.array(dti.dayofweek) < 6)    # Mon–Sat
+    ).astype(float)
+    return pd.Series(BUSINESS_PEAK_kW * in_hours, index=dti)
+
+
+def load_data_center(dti):
+    """
+    Load the instructor-provided DC CSV (30-min resolution).
+    Columns: timestamp, it_electrical_load_kw, cooling_thermal_load_kw, waste_heat_available_kw
+
+    Total electrical load = IT load + cooling electrical load.
+    Resamples to hourly mean and trims/pads to exactly 8760 hours.
+    Also returns waste_heat_kW for the district heating bonus task.
+    """
+    if os.path.exists(DATA_CENTER_CSV):
+        df = pd.read_csv(DATA_CENTER_CSV, parse_dates=["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Total electrical demand of the data center
+        df["total_electrical_kw"] = df["it_electrical_load_kw"] + df["cooling_thermal_load_kw"]
+
+        # Resample 30-min → hourly mean
+        df = df.set_index("timestamp")
+        hourly = df[["total_electrical_kw", "waste_heat_available_kw"]].resample("h").mean()
+
+        # Take first 8760 hours; pad with last value if shorter
+        vals_elec = hourly["total_electrical_kw"].values[:8760].astype(float)
+        vals_heat = hourly["waste_heat_available_kw"].values[:8760].astype(float)
+        if len(vals_elec) < 8760:
+            vals_elec = np.pad(vals_elec, (0, 8760 - len(vals_elec)), constant_values=vals_elec[-1])
+            vals_heat = np.pad(vals_heat, (0, 8760 - len(vals_heat)), constant_values=vals_heat[-1])
+
+        print(f"  ✓ Data center CSV loaded. Mean electrical load: {vals_elec.mean():.1f} kW")
+        dc_elec  = pd.Series(vals_elec, index=dti)
+        dc_heat  = pd.Series(vals_heat, index=dti)
+        return dc_elec, dc_heat
+    else:
+        print(f"  ⚠ DC CSV not found — using flat {DC_RATED_MW} MW placeholder.")
+        flat = pd.Series(DC_RATED_MW * 1000, index=dti)
+        return flat, flat * 0.4   # rough 40% waste heat estimate
+
+
+# =============================================================================
+# OPEN-METEO ERA5 WEATHER FETCH  (real data for Utsira)
+# =============================================================================
+
+def fetch_era5_weather(lat=UTSIRA_LAT, lon=UTSIRA_LON, year=WEATHER_YEAR,
+                       cache_file=WEATHER_CACHE):
+    """
+    Fetch hourly ERA5 reanalysis data from Open-Meteo archive API.
+
+    Variables fetched:
+      - wind_speed_10m   : m/s at 10 m above ground
+      - wind_speed_100m  : m/s at 100 m (≈ hub height)
+      - shortwave_radiation : W/m² global horizontal irradiance
+      - temperature_2m   : °C (used for PV temperature correction)
+
+    Returns a DataFrame with DatetimeIndex and those four columns.
+    Data is cached in WEATHER_CACHE so the API is only called once.
+    """
+    if os.path.exists(cache_file):
+        print(f"  ✓ Weather cache found: '{cache_file}' — loading...")
+        with open(cache_file) as f:
+            raw = json.load(f)
+    else:
+        url = (
+            "https://archive-api.open-meteo.com/v1/era5"
+            f"?latitude={lat}&longitude={lon}"
+            f"&start_date={year}-01-01&end_date={year}-12-31"
+            "&hourly=wind_speed_10m,wind_speed_100m,"
+            "shortwave_radiation,temperature_2m"
+            "&wind_speed_unit=ms"
+        )
+        print(f"  ↓ Fetching ERA5 data from Open-Meteo for Utsira ({lat}°N, {lon}°E)...")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+        with open(cache_file, "w") as f:
+            json.dump(raw, f)
+        print(f"  ✓ Saved to cache '{cache_file}'")
+
+    h = raw["hourly"]
+    df = pd.DataFrame({
+        "wind_10m":   h["wind_speed_10m"],
+        "wind_100m":  h["wind_speed_100m"],
+        "irradiance": h["shortwave_radiation"],
+        "temp_2m":    h["temperature_2m"],
+    }, index=pd.to_datetime(h["time"]))
+
+    # Trim to exactly 8760 hours (handles leap years)
+    return df.iloc[:8760]
+
+
+def wind_power_curve(v_ms, installed_MW):
+    """
+    Simple IEC class I-II wind turbine power curve.
+    Cut-in: 3 m/s | Rated: 12 m/s | Cut-out: 25 m/s
+    Cubic ramp between cut-in and rated speed.
+
+    Source: typical large offshore wind turbine (e.g., Vestas V112 / Siemens SG 4.5)
+    You should verify these parameters against the specific turbine chosen.
+    """
+    v    = np.asarray(v_ms, dtype=float)
+    V_CI = 3.0    # cut-in  (m/s)
+    V_R  = 12.0   # rated   (m/s)
+    V_CO = 25.0   # cut-out (m/s)
+
+    P_rated_kW = installed_MW * 1000
+
+    P = np.zeros_like(v)
+    ramp = (v >= V_CI) & (v < V_R)
+    full = (v >= V_R)  & (v <= V_CO)
+    P[ramp] = P_rated_kW * ((v[ramp] - V_CI) / (V_R - V_CI)) ** 3
+    P[full] = P_rated_kW
+    return P   # kW
+
+
+def pv_power_from_irradiance(irr_Wm2, temp_C, installed_MW,
+                              performance_ratio=0.80, temp_coeff=-0.0035):
+    """
+    Convert hourly GHI [W/m²] to PV output [kW].
+
+    Formula:  P = installed_kW × (G / G_STC) × PR × (1 + γ × (T_cell - 25))
+    where:
+      G_STC = 1000 W/m²   (standard test conditions)
+      PR    = performance ratio (wiring, inverter, soiling losses)
+      γ     = temperature coefficient of power (typically -0.003 to -0.005 /°C)
+      T_cell ≈ T_ambient + 25°C (NOCT approximation)
+
+    Source: IEC 61724 / PVGIS methodology
+    """
+    G      = np.asarray(irr_Wm2, dtype=float)
+    T_cell = np.asarray(temp_C, dtype=float) + 25.0   # NOCT approx
+    G_STC  = 1000.0
+
+    P_installed_kW = installed_MW * 1000
+    P = P_installed_kW * (G / G_STC) * performance_ratio * (
+        1 + temp_coeff * (T_cell - 25.0)
+    )
+    return np.clip(P, 0, P_installed_kW)   # kW
+
+
+# =============================================================================
+# PHASE 2 — SUPPLY
+# =============================================================================
+
+def build_wind_generation(dti, weather_df=None):
+    """
+    Hourly wind power in kW.
+    If weather_df is provided (from Open-Meteo ERA5), uses real wind_100m speeds
+    with a standard IEC power curve.
+    Falls back to synthetic profile if no weather data.
+    """
+    if weather_df is not None:
+        v100 = weather_df["wind_100m"].values
+        wind_kW = wind_power_curve(v100, WIND_INSTALLED_MW)
+        cf_actual = wind_kW.mean() / (WIND_INSTALLED_MW * 1000)
+        print(f"  ✓ ERA5 wind loaded. Capacity factor: {cf_actual:.3f}")
+        return pd.Series(wind_kW, index=dti)
+
+    # ── Fallback: synthetic (used only if fetch failed) ───────────────────
+    print("  ⚠  Using synthetic wind profile (ERA5 fetch failed).")
+    rng = np.random.default_rng(seed=42)
+    installed_kW = WIND_INSTALLED_MW * 1000
+    doy_frac = np.array((dti.dayofyear - 1) / 365)
+    seasonal_cf = WIND_CAPACITY_FACTOR * (1 + 0.25 * np.cos(2 * np.pi * doy_frac))
+    variability = rng.rayleigh(scale=1 / np.sqrt(2), size=8760)
+    variability = variability / variability.mean()
+    wind_kW = np.clip(installed_kW * seasonal_cf * variability, 0, installed_kW)
+    return pd.Series(wind_kW, index=dti)
+
+
+def build_solar_generation(dti, weather_df=None):
+    """
+    Hourly solar PV output in kW.
+    If weather_df is provided (from Open-Meteo ERA5), uses real shortwave_radiation
+    and temperature_2m with the IEC-based PV model.
+    Falls back to geometric model if no weather data.
+    """
+    if weather_df is not None:
+        irr  = weather_df["irradiance"].values
+        temp = weather_df["temp_2m"].values
+        solar_kW = pv_power_from_irradiance(irr, temp, SOLAR_INSTALLED_MW)
+        cf_actual = solar_kW.mean() / (SOLAR_INSTALLED_MW * 1000)
+        print(f"  ✓ ERA5 solar loaded. Capacity factor: {cf_actual:.3f}  "
+              f"(annual: {solar_kW.sum()/1e6:.3f} GWh)")
+        return pd.Series(solar_kW, index=dti)
+
+    # ── Fallback: geometric model ─────────────────────────────────────────
+    print("  ⚠  Using synthetic solar profile (ERA5 fetch failed).")
+    installed_kW = SOLAR_INSTALLED_MW * 1000
+    doy       = np.array(dti.dayofyear)
+    decl      = np.radians(23.45 * np.sin(np.radians(360 * (doy - 81) / 365)))
+    lat       = np.radians(59.3)
+    cos_ha_sr = np.clip(-np.tan(lat) * np.tan(decl), -1, 1)
+    ha_sr_rad = np.arccos(cos_ha_sr)
+    solar_hour = np.array(dti.hour) + 0.5 - 12
+    hour_angle = np.radians(15 * solar_hour)
+    cos_theta  = np.clip(
+        np.sin(lat) * np.sin(decl) + np.cos(lat) * np.cos(decl) * np.cos(hour_angle),
+        0, None)
+    solar_raw = installed_kW * cos_theta
+    if solar_raw.sum() > 0:
+        solar_kW = solar_raw * (SOLAR_CAPACITY_FACTOR * 8760 * installed_kW / solar_raw.sum())
+    else:
+        solar_kW = solar_raw
+    return pd.Series(np.clip(solar_kW, 0, installed_kW), index=dti)
+
+
+# =============================================================================
+# BATTERY / STORAGE
+# =============================================================================
+
+def calculate_battery_capacity(dc_load_kW, emergency_fraction=0.15, total_load_kW=None):
+    """
+    Size battery to cover Data Center + emergency services for 48 hours
+    during a complete Dunkelflaute (zero wind, zero solar).
+
+    emergency_fraction: fraction of total island load classed as 'emergency'.
+    """
+    dc_mean_kW    = float(np.mean(dc_load_kW))
+    emerg_kW      = emergency_fraction * float(np.mean(total_load_kW)) if total_load_kW is not None else 0
+    critical_kW   = dc_mean_kW + emerg_kW
+    battery_MWh   = critical_kW * BATTERY_DUNKELFLAUTE_HRS / 1000
+    return battery_MWh, critical_kW
+
+
+def simulate_battery(net_kW, capacity_MWh, initial_soc=0.5, efficiency=0.92):
+    """
+    Simple one-state battery dispatch model.
+
+    net_kW > 0  → surplus (charge battery)
+    net_kW < 0  → deficit (discharge battery)
+
+    Returns:
+        soc_MWh   — state of charge over time (MWh)
+        curtailed — surplus energy curtailed (kWh/hour)
+        deficit   — unmet demand (kWh/hour)
+    """
+    capacity_kWh = capacity_MWh * 1000
+    soc = initial_soc * capacity_kWh
+    soc_arr       = np.zeros(len(net_kW))
+    curtailed_arr = np.zeros(len(net_kW))
+    deficit_arr   = np.zeros(len(net_kW))
+
+    for i, p in enumerate(net_kW):
+        if p >= 0:    # surplus → charge
+            charge = min(p * efficiency, capacity_kWh - soc)
+            soc += charge
+            curtailed_arr[i] = p - charge / efficiency
+        else:         # deficit → discharge
+            discharge = min(-p, soc * efficiency)
+            soc -= discharge / efficiency
+            deficit_arr[i] = max(0, -p - discharge)
+        soc_arr[i] = soc
+
+    return soc_arr / 1000, curtailed_arr, deficit_arr   # convert SoC to MWh
+
+
+# =============================================================================
+# COLOUR PALETTE  (matches example report)
+# =============================================================================
+C = {
+    # Generation (positive side)
+    "wind":        "#1565c0",   # dark blue
+    "solar":       "#f9a825",   # amber/gold
+    "bat_dis":     "#ef6c00",   # orange  (battery discharge)
+    "curt_wind":   "#90caf9",   # light blue (curtailed wind)
+    "curt_solar":  "#fff176",   # light yellow (curtailed solar)
+    # Load (negative side)
+    "private":     "#c62828",   # dark red   (residential)
+    "ev":          "#ad1457",   # pink-red   (EV charging)
+    "industry":    "#6d4c41",   # brown      (salmon + water)
+    "business":    "#6a1b9a",   # purple     (business)
+    "dc_it":       "#00838f",   # teal       (DC IT)
+    "dc_cool":     "#f06292",   # pink       (DC cooling)
+    "bat_chg":     "#7b1fa2",   # deep purple (battery charge)
+    "unmet":       "#ff1744",   # bright red  (unmet load)
+}
+
+
+# =============================================================================
+# PLOTTING
+# =============================================================================
+
+def _slice(arr, mask):
+    """Return slice of array or Series using boolean mask."""
+    if hasattr(arr, "values"):
+        return arr.values[mask]
+    return arr[mask]
+
+
+def plot_signed_dispatch(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, battery_MWh,
+                         bat_charge_kW, title_suffix="Final Design"):
+    """
+    Full-year signed power dispatch plot matching example Figure 6.
+    Positive  = generation / battery discharge
+    Negative  = loads / battery charge
+    Resamples hourly → daily mean for readability.
+    """
+    # Build daily DataFrame
+    df = pd.DataFrame(index=dti)
+    df["wind"]      = np.asarray(wind_kW)
+    df["solar"]     = np.asarray(solar_kW)
+    df["bat_dis"]   = np.where(np.asarray(soc_MWh) > 0,
+                               np.clip(-np.asarray(wind_kW) - np.asarray(solar_kW) +
+                                       sum(np.asarray(v) for v in loads_dict.values()), 0, None),
+                               0)  # rough discharge proxy
+    df["curt"]      = curtailed
+    df["private"]   = -(loads_dict["Residential"] + loads_dict.get("EV charging", 0))
+    df["industry"]  = -(loads_dict.get("Salmon plant", 0) + loads_dict.get("Water/sanitation", 0))
+    df["business"]  = -loads_dict.get("Business", 0)
+    df["dc_it"]     = -loads_dict.get("Data center", 0) * 0.55   # rough IT fraction
+    df["dc_cool"]   = -loads_dict.get("Data center", 0) * 0.45   # rough cooling fraction
+    df["bat_chg"]   = -np.asarray(bat_charge_kW)
+    df["unmet"]     = deficit
+
+    daily = df.resample("D").mean() / 1000   # kW → MW
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+
+    # Positive stacked areas
+    ax.stackplot(daily.index,
+                 daily["wind"], daily["solar"], daily["bat_dis"], daily["curt"],
+                 labels=["Wind", "PV", "Battery discharge", "Curtailed"],
+                 colors=[C["wind"], C["solar"], C["bat_dis"], C["curt_wind"]],
+                 alpha=0.85)
+
+    # Negative stacked areas (flip sign for stackplot)
+    ax.stackplot(daily.index,
+                 daily["private"], daily["industry"], daily["business"],
+                 daily["dc_it"], daily["dc_cool"], daily["bat_chg"],
+                 labels=["Private (res+EV)", "Industry", "Business",
+                         "DC IT", "DC cooling", "Battery charge"],
+                 colors=[C["private"], C["industry"], C["business"],
+                         C["dc_it"], C["dc_cool"], C["bat_chg"]],
+                 alpha=0.85)
+
+    # Unmet load line
+    ax.plot(daily.index, -daily["unmet"], color=C["unmet"], lw=1.2,
+            ls="--", label="Unmet load")
+
+    ax.axhline(0, color="black", lw=0.😎
+    ax.set_ylabel("Power (MW)")
+    ax.set_title(f"Full-Year Signed Power Dispatch — {title_suffix}\n"
+                 "Positive: generation / discharge  |  Negative: loads / battery charge",
+                 fontsize=10)
+    ax.legend(loc="upper right", fontsize=7, ncol=5, framealpha=0.7)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig("plots/fig6_annual_signed_dispatch.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig6_annual_signed_dispatch.png")
+
+
+def _plot_week_panel(ax_supply, ax_demand, ax_soc,
+                     t, loads_dict_week, wind_w, solar_w,
+                     bat_dis_w, bat_chg_w, curtailed_w, deficit_w,
+                     soc_w, battery_MWh, label):
+    """
+    Draw a 3-panel week plot on supplied axes (supply / demand / SoC).
+    All inputs in kW; axes labels in kW.
+    """
+    total_demand = sum(loads_dict_week.values())
+    total_supply = wind_w + solar_w + bat_dis_w
+
+    # ── Panel 1: Supply ────────────────────────────────────────────────────
+    ax_supply.stackplot(t, wind_w/1000, solar_w/1000, bat_dis_w/1000, curtailed_w/1000,
+                        labels=["Wind output", "PV output",
+                                "Battery discharge", "Curtailed"],
+                        colors=[C["wind"], C["solar"], C["bat_dis"], C["curt_wind"]],
+                        alpha=0.85)
+    ax_supply.plot(t, total_demand/1000, color="black", lw=1.2,
+                   ls="--", label="Total demand")
+    if deficit_w.sum() > 0:
+        ax_supply.fill_between(t, total_supply/1000, total_demand/1000,
+                                where=(total_demand > total_supply),
+                                color=C["unmet"], alpha=0.4, label="Unmet load")
+    ax_supply.set_ylabel("Power (MW)")
+    ax_supply.set_title(f"Representative {label} Week", fontsize=9)
+    ax_supply.legend(fontsize=6, loc="upper right", ncol=2)
+    ax_supply.set_ylim(bottom=0)
+
+    # ── Panel 2: Demand breakdown ──────────────────────────────────────────
+    ax_demand.stackplot(t,
+                        loads_dict_week.get("Residential",0)/1000,
+                        loads_dict_week.get("EV charging",0)/1000,
+                        loads_dict_week.get("Business",0)/1000,
+                        loads_dict_week.get("Salmon plant",0)/1000 +
+                        loads_dict_week.get("Water/sanitation",0)/1000,
+                        loads_dict_week.get("Data center",0)*0.55/1000,
+                        loads_dict_week.get("Data center",0)*0.45/1000,
+                        bat_chg_w/1000,
+                        labels=["Private", "EV", "Business",
+                                "Industry", "DC IT", "DC cooling", "Bat charge"],
+                        colors=[C["private"], C["ev"], C["business"],
+                                C["industry"], C["dc_it"], C["dc_cool"], C["bat_chg"]],
+                        alpha=0.85)
+    ax_demand.plot(t, total_demand/1000, "k--", lw=1, label="Total demand")
+    ax_demand.set_ylabel("Power (MW)")
+    ax_demand.legend(fontsize=6, loc="upper right", ncol=3)
+    ax_demand.set_ylim(bottom=0)
+
+    # ── Panel 3: Battery SoC ──────────────────────────────────────────────
+    soc_pct = soc_w / battery_MWh * 100
+    ax_soc.fill_between(t, soc_pct, color="#a5d6a7", alpha=0.7, label="SoC (%)")
+    ax_soc.plot(t, soc_pct, color="green", lw=1)
+    ax_soc.axhline(100, color="red", ls="--", lw=0.8, label="Full")
+    ax_soc.axhline(20,  color="orange", ls="--", lw=0.8, label="Min 20%")
+    ax_soc.set_ylim(0, 110)
+    ax_soc.set_ylabel("SoC (%)")
+    ax_soc.legend(fontsize=6, loc="upper right")
+
+
+def plot_seasonal_weeks(dti, loads_dict, wind_kW, solar_kW,
+                        soc_MWh, curtailed, deficit, bat_charge_kW, battery_MWh):
+    """
+    Figure 7: 4 seasonal representative weeks in a 2×2 grid, each with 3 sub-panels.
+    """
+    seasons = {
+        "Winter":  pd.Timestamp("2025-01-13"),
+        "Spring":  pd.Timestamp("2025-04-07"),
+        "Summer":  pd.Timestamp("2025-07-07"),
+        "Autumn":  pd.Timestamp("2025-10-06"),
+    }
+
+    fig, axes = plt.subplots(4, 3, figsize=(18, 20), sharex="col")
+    fig.suptitle("Seasonal Weekly Dispatch — Final Design\n"
+                 "(Positive = Gen/Discharge, Negative = Load/Charge)",
+                 fontsize=12, y=1.01)
+
+    for row, (season, start) in enumerate(seasons.items()):
+        mask = (dti >= start) & (dti < start + pd.Timedelta(days=7))
+        t     = dti[mask]
+
+        ld = {k: v[mask] for k, v in loads_dict.items()}
+        w_w   = np.asarray(wind_kW)[mask]
+        s_w   = np.asarray(solar_kW)[mask]
+        soc_w = soc_MWh[mask]
+        cur_w = curtailed[mask]
+        def_w = deficit[mask]
+        chg_w = bat_charge_kW[mask]
+
+        # Estimate battery discharge: max(0, demand - wind - solar)
+        total_dem = sum(v for v in ld.values())
+        bd_w = np.clip(total_dem - w_w - s_w, 0, None)
+
+        _plot_week_panel(axes[row, 0], axes[row, 1], axes[row, 2],
+                         t, ld, w_w, s_w, bd_w, chg_w, cur_w, def_w,
+                         soc_w, battery_MWh, season)
+
+    plt.tight_layout()
+    plt.savefig("plots/fig7_seasonal_weeks.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  ✓ Saved plots/fig7_seasonal_weeks.png")
+
+
+def plot_worst_case_week(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, bat_charge_kW,
+                         battery_MWh, worst_start):
+    """
+    Figure 8: Worst-case Dunkelflaute week with battery depletion.
+    3-panel: supply, demand breakdown, SoC%.
+    """
+    mask  = (dti >= worst_start) & (dti < worst_start + pd.Timedelta(days=7))
+    t     = dti[mask]
+    ld    = {k: v[mask] for k, v in loads_dict.items()}
+    w_w   = np.asarray(wind_kW)[mask]
+    s_w   = np.asarray(solar_kW)[mask]
+    soc_w = soc_MWh[mask]
+    cur_w = curtailed[mask]
+    def_w = deficit[mask]
+    chg_w = bat_charge_kW[mask]
+    total_dem = sum(v for v in ld.values())
+    bd_w  = np.clip(total_dem - w_w - s_w, 0, None)
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    _plot_week_panel(axes[0], axes[1], axes[2],
+                     t, ld, w_w, s_w, bd_w, chg_w, cur_w, def_w,
+                     soc_w, battery_MWh,
+                     f"Worst Renewable Drought (Dunkelflaute) — {worst_start.strftime('%d %b')}")
+    fig.suptitle("Representative Worst Renewable Drought Week — Final Design", fontsize=11)
+    plt.tight_layout()
+    plt.savefig("plots/fig8_dunkelflaute_week.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig8_dunkelflaute_week.png")
+
+
+def plot_annual_soc(dti, soc_MWh, battery_MWh, bat_charge_kW):
+    """
+    Figure 9: Annual battery SoC profile (%) with charge/discharge power on secondary axis.
+    """
+    soc_pct = pd.Series(soc_MWh / battery_MWh * 100, index=dti)
+    chg     = pd.Series(bat_charge_kW / 1000, index=dti)   # MW
+
+    # Resample to daily
+    soc_d = soc_pct.resample("D").mean()
+    soc_min5 = soc_pct.resample("D").min().rolling(5, center=True).min()
+    chg_d = chg.resample("D").mean()
+
+    fig, ax1 = plt.subplots(figsize=(16, 5))
+    ax2 = ax1.twinx()
+
+    ax1.fill_between(soc_d.index, soc_d, color="#a5d6a7", alpha=0.5, label="SoC (%)")
+    ax1.plot(soc_d.index, soc_d, color="green", lw=1, label="SoC mean")
+    ax1.plot(soc_min5.index, soc_min5, color="orange", lw=1, ls="--", label="SoC min 5%")
+    ax1.axhline(20, color="red", ls=":", lw=0.8, label="Min 20% threshold")
+    ax1.set_ylabel("Battery SoC (%)", color="green")
+    ax1.set_ylim(0, 110)
+    ax1.tick_params(axis="y", colors="green")
+
+    ax2.bar(chg_d.index, chg_d.clip(lower=0), color="#7b1fa2", alpha=0.4,
+            label="Charging (MW)", width=1)
+    ax2.bar(chg_d.index, chg_d.clip(upper=0), color="#ef6c00", alpha=0.4,
+            label="Discharging (MW)", width=1)
+    ax2.set_ylabel("Charge / Discharge (MW)", color="#7b1fa2")
+    ax2.tick_params(axis="y", colors="#7b1fa2")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right", ncol=3)
+
+    ax1.set_title("Battery State of Charge — Full Year", fontsize=11)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig("plots/fig9_annual_soc.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig9_annual_soc.png")
+
+
+def plot_generation_profiles(dti, wind_kW, solar_kW):
+    """
+    Figure 11: Wind and solar generation profiles side by side.
+    """
+    wind_s  = pd.Series(np.asarray(wind_kW)/1000, index=dti)
+    solar_s = pd.Series(np.asarray(solar_kW)/1000, index=dti)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5), sharey=False)
+
+    # Wind
+    wind_d = wind_s.resample("D").mean()
+    ax1.bar(wind_d.index, wind_d, color=C["wind"], alpha=0.7, width=1, label="Wind output (MW)")
+    ax1.plot(wind_d.index, wind_s.resample("D").max(), color="lightblue",
+             lw=0.5, alpha=0.6, label="Daily max")
+    ax1.set_ylabel("Power (MW)")
+    ax1.set_title(f"Wind Generation Profile — {WIND_INSTALLED_MW} MW installed")
+    ax1.legend(fontsize=8)
+    fig.autofmt_xdate()
+
+    # Solar
+    solar_d = solar_s.resample("D").sum()   # daily GWh
+    ax2.bar(solar_d.index, solar_d * 24, color=C["solar"], alpha=0.8,
+            width=1, label="Daily solar energy (MWh)")
+    ax2.set_ylabel("Daily Energy (MWh)")
+    ax2.set_title(f"Solar PV Generation Profile — {SOLAR_INSTALLED_MW} MW installed")
+    ax2.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig("plots/fig11_generation_profiles.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig11_generation_profiles.png")
+
+
+def plot_monthly_breakdown(dti, loads_dict, wind_kW, solar_kW):
+    """Monthly energy breakdown bar chart."""
+    df = pd.DataFrame(loads_dict, index=dti)
+    df["Wind"]  = np.asarray(wind_kW)
+    df["Solar"] = np.asarray(solar_kW)
+    monthly = df.resample("ME").sum() / 1e6   # kWh → GWh
+
+    load_cols = list(loads_dict.keys())
+    load_colors = [C["private"], C["ev"], C["industry"], C["industry"],
+                   C["business"], C["dc_it"]][:len(load_cols)]
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    bottom = np.zeros(len(monthly))
+    for col, color in zip(load_cols, load_colors):
+        ax.bar(monthly.index, monthly[col], bottom=bottom,
+               label=col, color=color, alpha=0.85, width=20)
+        bottom += monthly[col].values
+
+    ax.plot(monthly.index, monthly["Wind"] + monthly["Solar"],
+            "k^--", lw=1.5, ms=6, label="Total supply (GWh)")
+    ax.plot(monthly.index, monthly["Wind"], color=C["wind"],
+            ls="--", lw=1, label="Wind (GWh)")
+    ax.set_ylabel("Energy (GWh)")
+    ax.set_title("Monthly Energy: Demand by Category vs. Renewable Supply")
+    ax.legend(fontsize=7, ncol=4)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig("plots/monthly_breakdown.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/monthly_breakdown.png")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    print("\n" + "=" * 65)
+    print("  G-Nexus Utsira Alpha — Hourly Energy Simulation")
+    print("=" * 65)
+
+    dti = build_hourly_index()
+
+    # ── Demand ────────────────────────────────────────────────────────────────
+    print("\n[1/4] Building demand profiles...")
+    res_kW    = build_residential_load(dti)
+    salmon_kW = build_salmon_load(dti)
+    water_kW  = build_water_sanitation_load(dti)
+    ev_kW     = build_ev_load(dti)
+    biz_kW    = build_business_load(dti)
+    dc_kW, dc_waste_heat_kW = load_data_center(dti)
+
+    demand_kW = res_kW + salmon_kW + water_kW + ev_kW + biz_kW + dc_kW
+
+    loads_dict = {
+        "Residential": np.asarray(res_kW),
+        "Salmon plant": np.asarray(salmon_kW),
+        "Water/sanitation": np.asarray(water_kW),
+        "EV charging": np.asarray(ev_kW),
+        "Business": np.asarray(biz_kW),
+        "Data center": np.asarray(dc_kW),
+    }
+
+    # ── Supply ────────────────────────────────────────────────────────────────
+    print("[2/4] Fetching ERA5 weather data & building generation profiles...")
+    weather_df = None
+    try:
+        weather_df = fetch_era5_weather()
+    except Exception as e:
+        print(f"  ⚠  ERA5 fetch failed ({e}). Falling back to synthetic profiles.")
+
+    wind_kW   = build_wind_generation(dti, weather_df)
+    solar_kW  = build_solar_generation(dti, weather_df)
+    supply_kW = wind_kW + solar_kW
+
+    # ── Battery sizing ────────────────────────────────────────────────────────
+    print("[3/4] Sizing battery & running dispatch...")
+    battery_MWh, critical_kW = calculate_battery_capacity(
+        dc_kW.values, emergency_fraction=0.15, total_load_kW=demand_kW.values
+    )
+
+    net_kW = supply_kW.values - demand_kW.values
+    soc_MWh, curtailed, deficit = simulate_battery(net_kW, battery_MWh)
+
+    # Battery charge power (kW) = positive net capped at what was actually charged
+    bat_charge_kW = np.where(net_kW > 0, net_kW - curtailed, 0)
+
+    # ── Results summary ───────────────────────────────────────────────────────
+    print("\n" + "─" * 65)
+    print("  ANNUAL SUMMARY")
+    print("─" * 65)
+    print(f"  Total annual demand      : {demand_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Residential          : {res_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Salmon processing    : {salmon_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Water/sanitation     : {water_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — EV charging          : {ev_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Business             : {biz_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Data center          : {dc_kW.sum()/1e6:7.2f} GWh")
+    print(f"  Total annual supply      : {supply_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Wind ({WIND_INSTALLED_MW} MW)         : {wind_kW.sum()/1e6:7.2f} GWh")
+    print(f"    — Solar ({SOLAR_INSTALLED_MW} MW)        : {solar_kW.sum()/1e6:7.2f} GWh")
+    print(f"  Battery capacity (sized) : {battery_MWh:7.1f} MWh")
+    print(f"  Critical load (DC+emerg) : {critical_kW/1000:7.2f} MW")
+    print(f"  Unmet demand (deficit)   : {deficit.sum()/1e6:7.3f} GWh  ({100*deficit.sum()/demand_kW.sum():.2f}%)")
+    print(f"  Curtailed surplus        : {curtailed.sum()/1e6:7.3f} GWh")
+    peak_demand = demand_kW.max()
+    print(f"  Peak demand              : {peak_demand/1000:7.2f} MW")
+    print("─" * 65)
+
+    if deficit.sum() / demand_kW.sum() > 0.01:
+        print("  ⚠  Unmet demand > 1%. Consider increasing wind/solar or battery.")
+    else:
+        print("  ✓  System meets > 99% of demand.")
+
+    # ── BONUS: District Heating (Task 3) ──────────────────────────────────────
+    # Estimate how much waste heat from DC + salmon plant could displace
+    # electric resistance heating in homes during winter.
+    #
+    # Winter peak electrical heating load (rough estimate):
+    #   Norwegian homes: ~60% of winter electricity is space heating
+    HEATING_FRACTION_OF_RESIDENTIAL = 0.60
+    winter_mask = (dti.month <= 2) | (dti.month == 12)
+    winter_heating_kW = res_kW[winter_mask] * HEATING_FRACTION_OF_RESIDENTIAL
+
+    # Heat available from DC waste heat during winter
+    dc_heat_winter = dc_waste_heat_kW[winter_mask]
+    # Salmon plant waste heat (cold-chain compressor heat rejection ~20% of electrical input)
+    salmon_waste_heat_kW = salmon_kW * 0.20
+    salmon_heat_winter = salmon_waste_heat_kW[winter_mask]
+
+    total_available_heat_kW = dc_heat_winter + salmon_heat_winter
+    # District heating COP ~3 (heat pump + distribution)
+    dh_useful_heat_kW = total_available_heat_kW * 3.0
+    # How much of winter heating demand can be met?
+    dh_covered = np.minimum(dh_useful_heat_kW.values, winter_heating_kW.values)
+    # Electrical saving = covered heat / COP_of_existing_resistance_heaters(≈1)
+    # (replace resistance heaters → saving equals the heat supplied)
+    electrical_saving_winter_MW = dh_covered.mean() / 1000
+
+    print(f"\n  [BONUS] District Heating Analysis")
+    print(f"  DC mean waste heat        : {dc_waste_heat_kW.mean():.1f} kW")
+    print(f"  Winter heating demand avg : {winter_heating_kW.mean():.1f} kW")
+    print(f"  DH potential (DC+salmon)  : {total_available_heat_kW.mean():.1f} kW thermal")
+    print(f"  Electrical winter saving  : {electrical_saving_winter_MW:.3f} MW")
+    print(f"  ⟹ DH reduces winter peak by ~{electrical_saving_winter_MW:.2f} MW")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    print("\n[4/4] Generating plots...")
+
+    # Fig 6 — Full-year signed dispatch
+    plot_signed_dispatch(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, battery_MWh,
+                         bat_charge_kW)
+
+    # Fig 7 — 4-season weekly panels
+    plot_seasonal_weeks(dti, loads_dict, wind_kW, solar_kW,
+                        soc_MWh, curtailed, deficit, bat_charge_kW, battery_MWh)
+
+    # Fig 8 — Worst-case Dunkelflaute week
+    rolling_supply = pd.Series(supply_kW.values).rolling(48).sum()
+    worst_end_idx  = int(rolling_supply.idxmin())
+    worst_start    = dti[max(0, worst_end_idx - 48)]
+    plot_worst_case_week(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, bat_charge_kW,
+                         battery_MWh, worst_start)
+
+    # Fig 9 — Annual SoC
+    plot_annual_soc(dti, soc_MWh, battery_MWh, bat_charge_kW)
+
+    # Monthly breakdown
+    plot_monthly_breakdown(dti, loads_dict, wind_kW, solar_kW)
+
+    # Fig 11 — Wind + solar profiles
+    plot_generation_profiles(dti, wind_kW, solar_kW)
+
+    print("\n  All done! Check the 'plots/' folder.\n")
+
+
+if _name_ == "_main_":
+    main()
+www.ssb.no
