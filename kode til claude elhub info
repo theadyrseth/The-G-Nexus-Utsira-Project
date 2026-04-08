@@ -1,0 +1,90 @@
+"""
+Henter energiforbruksdata for Utsira (kommunenr. 1151) fra Elhub sitt åpne API.
+Kjør dette scriptet på din egen PC — krever internettilgang.
+ 
+Installér avhengigheter først:
+    pip install requests pandas
+ 
+Output: utsira_elhub.json  +  utsira_elhub_monthly.csv
+"""
+ 
+import requests
+import pandas as pd
+import json
+ 
+MUNICIPALITY_NR = "1151"   # Utsira
+ 
+DATASETS = {
+    "monthly": "CONSUMPTION_PER_GROUP_MUNICIPALITY_MONTH",
+    "hourly":  "CONSUMPTION_PER_GROUP_MUNICIPALITY_HOUR",
+}
+ 
+BASE_URL = "https://api.elhub.no/energy-data/v0/municipalities"
+ 
+ 
+def fetch_elhub(dataset_key="monthly"):
+    dataset = DATASETS[dataset_key]
+    url = f"{BASE_URL}?dataset={dataset}&municipalityNumber={MUNICIPALITY_NR}"
+    print(f"Henter: {url}")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"  ✓ Mottok {len(str(data))} tegn")
+    return data
+ 
+ 
+def parse_to_dataframe(raw):
+    """
+    Elhub returnerer typisk en liste med objekter.
+    Prøver å finne 'data'-nøkkelen eller konverterer direkte.
+    """
+    if isinstance(raw, list):
+        df = pd.DataFrame(raw)
+    elif isinstance(raw, dict):
+        # Finn første nøkkel som er en liste
+        for key, val in raw.items():
+            if isinstance(val, list) and len(val) > 0:
+                print(f"  Bruker nøkkel: '{key}'")
+                df = pd.DataFrame(val)
+                break
+        else:
+            df = pd.DataFrame([raw])
+    else:
+        raise ValueError(f"Ukjent format: {type(raw)}")
+    return df
+ 
+ 
+def main():
+    # --- Månedlig data (god til å kalibrere sesongprofil) ---
+    raw_monthly = fetch_elhub("monthly")
+ 
+    # Lagre rådata som JSON
+    with open("utsira_elhub.json", "w") as f:
+        json.dump(raw_monthly, f, ensure_ascii=False, indent=2)
+    print("  ✓ Lagret utsira_elhub.json")
+ 
+    # Konverter til DataFrame
+    df = parse_to_dataframe(raw_monthly)
+    print(f"\nKolonner: {list(df.columns)}")
+    print(df.head(10).to_string())
+ 
+    # Lagre som CSV
+    df.to_csv("utsira_elhub_monthly.csv", index=False)
+    print("\n  ✓ Lagret utsira_elhub_monthly.csv")
+ 
+    # --- Oppsummering ---
+    print("\n=== OPPSUMMERING ===")
+    # Se etter kolonner med forbruk/kWh-verdier
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    if num_cols:
+        print(f"Numeriske kolonner: {num_cols}")
+        print(df[num_cols].describe().to_string())
+ 
+    print("\nNeste steg:")
+    print("  Last opp 'utsira_elhub.json' eller 'utsira_elhub_monthly.csv'")
+    print("  til Claude, så integreres det i simuleringen.")
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
