@@ -1,0 +1,1089 @@
+"""
+G-Nexus Utsira — Hourly Energy Balance Simulation
+ENP120 Energy Technology | Spring 2026
+
+Run:  python utsira_simulation.py
+Output plots saved to ./plots/
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import os
+import json
+import io
+import requests
+import urllib3
+from matplotlib.patches import Patch
+
+os.makedirs("plots", exist_ok=True)
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DATA_CENTER_CSV = "The G-Nexus Data Center_Updated.csv"
+
+# Simulation year
+SIM_YEAR = 2024
+
+# Location & weather
+UTSIRA_LAT = 59.3085
+UTSIRA_LON = 4.8827
+WEATHER_YEAR = SIM_YEAR
+WEATHER_CACHE = "utsira_weather_cache.json"
+
+# Island population — SSB Kommunefakta Utsira
+PERSONS = 219
+N_HOUSEHOLDS = 106   # 219 / 2.07 persons per HH (SSB 2023)
+
+# Salmon plant — FAO Fisheries Technical Paper 520 / Nofima
+SALMON_TONS_PER_YEAR = 55
+SALMON_SEC_kWh_PER_TON = 105.7
+SALMON_OPERATING_HOURS = 6_000
+
+# Water & sanitation — Norsk Vann rapport B22/2022
+WATER_SANITATION_kW = 30
+
+# EV charging — assignment spec + Enova EV-rapport 2023
+N_CHARGING_POINTS = 200
+EV_CHARGER_kW = 7.4
+EV_EVENING_START_HOUR = 17
+EV_EVENING_END_HOUR = 21
+EV_SIMULTANEOUS_FACTOR = 1.0
+
+
+# Wind — 2× Vestas V90-2.0 MW
+N_WIND_TURBINES = 2
+TURBINE_RATED_MW = 2.0
+WIND_INSTALLED_MW = N_WIND_TURBINES * TURBINE_RATED_MW
+
+VESTAS_V90_MS = [0, 3.9, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 25, 25.1]
+VESTAS_V90_KW = [0, 0, 66, 154, 282, 456, 680, 957, 1270, 1570,
+                 1820, 1970, 2000, 2000, 0]
+
+# Solar PV
+N_SOLAR_PANELS = 800
+PANEL_RATED_WP = 405
+SOLAR_INSTALLED_MW = (N_SOLAR_PANELS * PANEL_RATED_WP) / 1e6
+
+# Battery — Tesla Megapack 2XL
+# Source: Tesla Megapack product page (tesla.com/megapack)
+MEGAPACK_CAPACITY_MWh = 3.9   # usable energy per unit
+MEGAPACK_POWER_MW     = 1.9   # max charge/discharge power per unit
+N_MEGAPACKS           = 18     # number of units  ← endre dette
+
+# Elhub open data — municipality 1151 (Utsira, Rogaland)
+UTSIRA_MUNICIPALITY_CODE = "1151"
+
+ELHUB_CSV_URL = (
+    "https://data.elhub.no/download/consumption_per_group_municipality_hour/"
+    "consumption_per_group_municipality_hour-all-en-0000-00-00.csv"
+)
+
+ELHUB_CACHE = "utsira_elhub_cache.json"
+
+# =============================================================================
+# DEMAND BUILDERS
+# =============================================================================
+
+
+def build_salmon_load(dti):
+    """Flat weekday plant load, rescaled to annual target."""
+    annual_kWh = SALMON_TONS_PER_YEAR * SALMON_SEC_kWh_PER_TON
+    avg_op_kW = annual_kWh / SALMON_OPERATING_HOURS
+    operating = (
+        (np.array(dti.hour) >= 6)
+        & (np.array(dti.hour) < 18)
+        & (np.array(dti.dayofweek) < 5)
+    ).astype(float)
+    seasonal = np.where(
+        (np.array(dti.month) >= 10) | (np.array(dti.month) <= 1), 1.3, 1.0
+    )
+    raw = operating * avg_op_kW * seasonal
+    if raw.sum() > 0:
+        raw *= annual_kWh / raw.sum()
+    return raw
+
+
+def build_water_sanitation_load(dti):
+    """Near-constant water/sanitation load with small daytime boost."""
+    diurnal = 0.9 + 0.1 * np.clip(np.sin(np.pi * (np.array(dti.hour) - 6) / 12), 0, 1)
+    return pd.Series(WATER_SANITATION_kW * diurnal, index=dti)
+
+
+def build_ev_load(dti):
+    """Evening EV charging spike."""
+    peak_kW = N_CHARGING_POINTS * EV_CHARGER_kW * EV_SIMULTANEOUS_FACTOR
+    in_window = (
+        (np.array(dti.hour) >= EV_EVENING_START_HOUR)
+        & (np.array(dti.hour) < EV_EVENING_END_HOUR)
+    ).astype(float)
+    weekday = np.where(np.array(dti.dayofweek) < 5, 1.0, 0.7)
+    return pd.Series(peak_kW * in_window * weekday, index=dti)
+
+
+
+def load_data_center(dti):
+    """Load DC CSV (30-min) and resample to hourly. Falls back to flat 1 MW."""
+    if os.path.exists(DATA_CENTER_CSV):
+        df = pd.read_csv(DATA_CENTER_CSV, parse_dates=["timestamp"])
+        df = df.sort_values("timestamp").set_index("timestamp")
+        df["total_kw"] = df["it_electrical_load_kw"] + df["cooling_thermal_load_kw"]
+        vals = df["total_kw"].resample("h").mean().values[:8760].astype(float)
+        if len(vals) < 8760:
+            vals = np.pad(vals, (0, 8760 - len(vals)), constant_values=vals[-1])
+        print(f"  ✓ DC CSV loaded. Mean load: {vals.mean():.1f} kW")
+        return pd.Series(vals, index=dti)
+
+    print("  ⚠ DC CSV not found — using flat 1 MW placeholder.")
+    return pd.Series(1000.0, index=dti)
+
+
+# =============================================================================
+# WEATHER & GENERATION
+# =============================================================================
+
+def fetch_era5_weather():
+    """Fetch ERA5 hourly wind/solar/temp from Open-Meteo; cache locally."""
+    if os.path.exists(WEATHER_CACHE):
+        print("  ✓ Weather cache found — loading...")
+        with open(WEATHER_CACHE) as f:
+            raw = json.load(f)
+    else:
+        url = (
+            f"https://archive-api.open-meteo.com/v1/era5"
+            f"?latitude={UTSIRA_LAT}&longitude={UTSIRA_LON}"
+            f"&start_date={WEATHER_YEAR}-01-01&end_date={WEATHER_YEAR}-12-31"
+            "&hourly=wind_speed_10m,wind_speed_100m,shortwave_radiation,temperature_2m"
+            "&wind_speed_unit=ms"
+        )
+        print(f"  ↓ Fetching ERA5 from Open-Meteo for Utsira ({UTSIRA_LAT}°N)...")
+        raw = requests.get(url, timeout=30).json()
+        with open(WEATHER_CACHE, "w") as f:
+            json.dump(raw, f)
+        print(f"  ✓ Cached to '{WEATHER_CACHE}'")
+
+    h = raw["hourly"]
+    df = pd.DataFrame(
+        {
+            "wind_100m": h["wind_speed_100m"],
+            "irradiance": h["shortwave_radiation"],
+            "temp_2m": h["temperature_2m"],
+        },
+        index=pd.to_datetime(h["time"]),
+    )
+    return df.iloc[:8760]
+
+
+# =============================================================================
+# ELHUB DATA — STREAMING DOWNLOAD  (bug-fixed rewrite)
+# =============================================================================
+
+def _detect_column_map(header_line, sep):
+    """
+    Map raw column names (Norwegian or English) to internal names.
+    Returns dict: internal_name -> original_name, or None if required cols missing.
+    """
+    cols = {c.strip().upper(): c.strip() for c in header_line.split(sep)}
+
+    start_col = (
+        cols.get("START_TID")
+        or cols.get("STARTTID")
+        or cols.get("START_TIME")
+        or cols.get("STARTTIME")
+    )
+    knr_col = (
+        cols.get("KOMMUNENUMMER")
+        or cols.get("MUNICIPALITYNUMBER")
+        or cols.get("MUNICIPALITY_NO")
+        or cols.get("MUNICIPALITY_NUMBER")
+    )
+    grp_col = (
+        cols.get("FORBRUKSGRUPPE")
+        or cols.get("CONSUMPTION_GROUP")
+        or cols.get("CONSUMPTIONGROUP")
+        or cols.get("CONSUMERGROUP")
+        or cols.get("CONSUMER_GROUP")
+    )
+    vol_col = (
+        cols.get("VOLUM_KWH")
+        or cols.get("VOLUME_KWH")
+        or cols.get("CONSUMPTION_KWH")
+        or cols.get("QUANTITY")
+    )
+
+    if not all([start_col, knr_col, grp_col, vol_col]):
+        print(f"  ⚠ Klarte ikke å identifisere alle nødvendige kolonner.")
+        print(f"    Kolonner i headeren: {list(cols.values())}")
+        print(f"    start={start_col}, knr={knr_col}, grp={grp_col}, vol={vol_col}")
+        return None
+
+    return {
+        "startTime": start_col,
+        "municipalityNo": knr_col,
+        "consumerGroup": grp_col,
+        "consumption_kWh": vol_col,
+    }
+
+
+def _filter_chunk(chunk_df, col_map):
+    """Rename columns, filter for Utsira + SIM_YEAR, return filtered DataFrame."""
+    rename = {v: k for k, v in col_map.items()}
+    chunk_df = chunk_df.rename(columns=rename)
+
+    chunk_df["municipalityNo"] = chunk_df["municipalityNo"].astype(str).str.strip().str.zfill(4)
+    # utc=True handles mixed CET/CEST timestamps; tz_convert(None) strips tz for naive index
+    chunk_df["startTime"] = (
+        pd.to_datetime(chunk_df["startTime"], errors="coerce", utc=True)
+        .dt.tz_convert(None)
+    )
+    chunk_df["consumption_kWh"] = pd.to_numeric(chunk_df["consumption_kWh"], errors="coerce")
+
+    mask = (
+        (chunk_df["municipalityNo"] == UTSIRA_MUNICIPALITY_CODE.zfill(4))
+        & (chunk_df["startTime"].dt.year == SIM_YEAR)
+    )
+    return chunk_df.loc[mask, ["startTime", "municipalityNo", "consumerGroup", "consumption_kWh"]].copy()
+
+
+def _stream_elhub(verify_ssl=True, chunk_lines=50_000):
+    """
+    Stream the Elhub CSV line by line. Never loads the full file into memory.
+    Yields filtered DataFrames for Utsira / SIM_YEAR only.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; ENP120-simulation/1.0)",
+        "Accept": "text/csv,application/csv,text/plain,*/*",
+    }
+
+    if not verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    with requests.get(
+        ELHUB_CSV_URL,
+        headers=headers,
+        stream=True,
+        timeout=300,
+        verify=verify_ssl,
+    ) as resp:
+        resp.raise_for_status()
+
+        header_line = None
+        sep = ","
+        col_map = None
+        buffer = []
+        rows_read = 0
+        rows_matched = 0
+
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            if raw_line is None:
+                continue
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            # First non-empty line is the header
+            if header_line is None:
+                header_line = line
+                sep = ";" if line.count(";") > line.count(",") else ","
+                print(f"  ℹ Skilletegn: '{sep}'  |  Header: {line[:120]}...")
+                col_map = _detect_column_map(header_line, sep)
+                if col_map is None:
+                    raise ValueError("Fant ikke nødvendige kolonner i Elhub-filen.")
+                buffer = [header_line]
+                continue
+
+            buffer.append(line)
+            rows_read += 1
+
+            if len(buffer) >= chunk_lines + 1:  # +1 for header
+                text = "\n".join(buffer)
+                try:
+                    df_chunk = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, low_memory=False)
+                    filtered = _filter_chunk(df_chunk, col_map)
+                    if not filtered.empty:
+                        rows_matched += len(filtered)
+                        yield filtered
+                except Exception as e:
+                    print(f"  ⚠ Feil ved lesing av chunk ({rows_read} rader lest): {e}")
+                buffer = [header_line]  # reset with header
+
+        # Flush remaining lines
+        if len(buffer) > 1:
+            text = "\n".join(buffer)
+            try:
+                df_chunk = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, low_memory=False)
+                filtered = _filter_chunk(df_chunk, col_map)
+                if not filtered.empty:
+                    rows_matched += len(filtered)
+                    yield filtered
+            except Exception as e:
+                print(f"  ⚠ Feil i siste chunk: {e}")
+
+        print(f"  ℹ Leste {rows_read:,} rader totalt, matchet {rows_matched} for Utsira {SIM_YEAR}.")
+
+
+def fetch_elhub_consumption():
+    """
+    Load Utsira consumption data from Elhub using streaming download.
+    Falls back to verify=False on SSL errors.
+    Returns a DataFrame or None (triggers SSB fallback).
+    """
+    if os.path.exists(ELHUB_CACHE):
+        print("  ✓ Elhub cache funnet — laster inn...")
+        with open(ELHUB_CACHE) as f:
+            data = json.load(f)
+        df = pd.DataFrame(data)
+        # Handle both ISO strings and epoch-ms integers (legacy cache format)
+        if df["startTime"].dtype == object:
+            df["startTime"] = pd.to_datetime(df["startTime"], errors="coerce", utc=True).dt.tz_convert(None)
+        else:
+            df["startTime"] = pd.to_datetime(df["startTime"], unit="ms", errors="coerce")
+        return df
+
+    print("  ↓ Streamer Elhub-data (stor fil — filtrerer for Utsira underveis)...")
+    print(f"    URL: {ELHUB_CSV_URL}")
+
+    chunks = []
+
+    for verify in (True, False):
+        if not verify:
+            print("  ⚠ SSL-feil. Prøver igjen uten sertifikatkontroll...")
+        try:
+            for df_chunk in _stream_elhub(verify_ssl=verify):
+                chunks.append(df_chunk)
+                print(f"    … {sum(len(c) for c in chunks)} rader hentet så langt", end="\r")
+            break  # Success — no need to retry
+        except requests.exceptions.SSLError:
+            if verify:
+                continue   # retry without SSL
+            print("  ⚠ SSL-feil selv uten verifisering. Bruker SSB-estimater.")
+            return None
+        except requests.exceptions.HTTPError as e:
+            print(f"  ⚠ HTTP-feil: {e}")
+            return None
+        except ValueError as e:
+            # Column detection failed
+            print(f"  ⚠ Kolonnedeteksjon feilet: {e}")
+            return None
+        except Exception as e:
+            print(f"  ⚠ Nedlasting feilet: {e}")
+            if verify:
+                continue
+            return None
+
+    if not chunks:
+        print(f"  ⚠ Ingen data funnet for kommune {UTSIRA_MUNICIPALITY_CODE}, år {SIM_YEAR}.")
+        print("  ⚠ Bruker SSB-estimater.")
+        return None
+
+    df = pd.concat(chunks, ignore_index=True)
+    print(f"\n  ✓ Elhub-data lastet: {len(df)} rader for Utsira {SIM_YEAR}.")
+    df.to_json(ELHUB_CACHE, orient="records", date_format="iso")
+    print(f"  ✓ Cachet til '{ELHUB_CACHE}'")
+    return df
+
+
+def elhub_to_hourly_loads(df, dti):
+    """Convert Elhub DataFrame to hourly kW series per consumer group."""
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    df["startTime"] = pd.to_datetime(df["startTime"], errors="coerce")
+    df["consumption_kWh"] = pd.to_numeric(df["consumption_kWh"], errors="coerce")
+    df["consumerGroup"] = df["consumerGroup"].astype(str).str.strip().str.lower()
+    df = df.dropna(subset=["startTime", "consumption_kWh"])
+
+    print(f"  ℹ Elhub kolonner: {list(df.columns)}")
+    print(f"  ℹ Forbruksgrupper: {sorted(df['consumerGroup'].unique())}")
+
+    residential_groups = [
+        "husholdning", "residential",
+        "private",     # alternative Elhub label
+    ]
+    industry_groups = [
+        "jordbruk", "industri", "næring", "offentlig",
+        "agriculture", "industry", "business", "public",
+        "commercial", "service", "tjenesteyting",
+    ]
+
+    mask_res = df["consumerGroup"].isin(residential_groups)
+    mask_ind = df["consumerGroup"].isin(industry_groups)
+
+    res   = df.loc[mask_res].groupby("startTime")["consumption_kWh"].sum()
+    ind   = df.loc[mask_ind].groupby("startTime")["consumption_kWh"].sum()
+    total = df.groupby("startTime")["consumption_kWh"].sum()
+
+    results = {}
+    if not res.empty:
+        results["residential_kW"] = res.reindex(dti).fillna(0.0)
+    if not ind.empty:
+        results["industry_kW"] = ind.reindex(dti).fillna(0.0)
+    results["total_kW"] = total.reindex(dti).fillna(0.0)
+
+    print(
+        f"  ✓ Elhub Utsira — snitt: {results['total_kW'].mean():.1f} kW"
+        f" | år: {results['total_kW'].sum()/1e6:.3f} GWh"
+    )
+    return results
+
+
+# =============================================================================
+# GENERATION
+# =============================================================================
+
+def wind_power_curve(v_ms):
+    """Vestas V90-2.0 MW power curve × N_WIND_TURBINES, returns kW."""
+    scale = N_WIND_TURBINES
+    curve_kW = np.array(VESTAS_V90_KW) * scale
+    return np.clip(
+        np.interp(np.asarray(v_ms, float), VESTAS_V90_MS, curve_kW),
+        0,
+        WIND_INSTALLED_MW * 1000,
+    )
+
+
+def pv_power(irr_Wm2, temp_C, PR=0.80, gamma=-0.0026):
+    """IEC 61724 PV model."""
+    G = np.asarray(irr_Wm2, float)
+    T_cell = np.asarray(temp_C, float) + 25.0
+    P_kW = SOLAR_INSTALLED_MW * 1000
+    return np.clip(P_kW * (G / 1000) * PR * (1 + gamma * (T_cell - 25)), 0, P_kW)
+
+
+def build_wind_generation(dti, weather_df):
+    """Hourly wind kW — ERA5 power curve via Vestas V90 datasheet."""
+    if weather_df is None:
+        raise RuntimeError(
+            "\n\n  ✗ ERA5 vinddata er ikkje tilgjengeleg.\n"
+            "    Sjekk internettforbindelsen din og prøv igjen.\n"
+            "    Viss problemet vedvarar kan Open-Meteo vera nede:\n"
+            "    https://open-meteo.com\n"
+        )
+    kW = wind_power_curve(weather_df["wind_100m"].values)
+    print(f"  ✓ ERA5 wind CF: {kW.mean() / (WIND_INSTALLED_MW * 1000):.3f}")
+    return pd.Series(kW, index=dti)
+
+
+def build_solar_generation(dti, weather_df):
+    """Hourly solar PV kW — ERA5 irradiance via IEC 61724 model."""
+    if weather_df is None:
+        raise RuntimeError(
+            "\n\n  ✗ ERA5 soldata er ikkje tilgjengeleg.\n"
+            "    Sjekk internettforbindelsen din og prøv igjen.\n"
+            "    Viss problemet vedvarar kan Open-Meteo vera nede:\n"
+            "    https://open-meteo.com\n"
+        )
+    kW = pv_power(weather_df["irradiance"].values, weather_df["temp_2m"].values)
+    print(
+        f"  ✓ ERA5 solar CF: {kW.mean() / (SOLAR_INSTALLED_MW * 1000):.3f}  "
+        f"({kW.sum()/1e6:.3f} GWh/yr)"
+    )
+    return pd.Series(kW, index=dti)
+
+
+# =============================================================================
+# BATTERY
+# =============================================================================
+
+def get_battery_specs():
+    """Return total battery capacity (MWh) and max power (kW) from Megapack config."""
+    capacity_MWh = N_MEGAPACKS * MEGAPACK_CAPACITY_MWh
+    power_kW     = N_MEGAPACKS * MEGAPACK_POWER_MW * 1000
+    print(f"  ✓ Battery: {N_MEGAPACKS}× Tesla Megapack 2XL "
+          f"= {capacity_MWh:.1f} MWh  |  {power_kW/1000:.1f} MW")
+    return capacity_MWh, power_kW
+
+
+def simulate_battery(net_kW, capacity_MWh, max_power_kW, initial_soc=0.5, efficiency=0.92):
+    """
+    Hourly battery dispatch with power limit (MW) and energy limit (MWh).
+    Returns soc_MWh, curtailed_kW, deficit_kW.
+    """
+    cap = capacity_MWh * 1000
+    soc = initial_soc * cap
+    soc_arr = np.zeros(len(net_kW))
+    curt    = np.zeros(len(net_kW))
+    deficit = np.zeros(len(net_kW))
+
+    for i, p in enumerate(net_kW):
+        if p >= 0:
+            # Charge — limited by available power AND remaining capacity
+            charge = min(p * efficiency, cap - soc, max_power_kW * efficiency)
+            soc   += charge
+            curt[i] = p - charge / efficiency
+        else:
+            # Discharge — limited by available power AND stored energy
+            discharge   = min(-p, soc * efficiency, max_power_kW)
+            soc        -= discharge / efficiency
+            deficit[i]  = max(0, -p - discharge)
+
+        soc_arr[i] = soc
+
+    return soc_arr / 1000, curt, deficit
+
+
+# =============================================================================
+# COLOUR PALETTE
+# =============================================================================
+
+C = {
+    "wind": "#1565c0",
+    "solar": "#f9a825",
+    "bat_dis": "#ef6c00",
+    "curt_wind": "#90caf9",
+    "private": "#c62828",
+    "ev": "#ad1457",
+    "industry": "#6d4c41",
+    "business": "#6a1b9a",
+    "dc_it": "#00838f",
+    "dc_cool": "#f06292",
+    "bat_chg": "#7b1fa2",
+    "unmet": "#ff1744",
+}
+
+# =============================================================================
+# PLOTS
+# =============================================================================
+
+def plot_monthly_production(dti, wind_kW, solar_kW, demand_kW):
+    """Monthly stacked production bars vs. demand line."""
+    df = pd.DataFrame(
+        {
+            "Wind": np.asarray(wind_kW),
+            "Solar": np.asarray(solar_kW),
+            "Demand": np.asarray(demand_kW),
+        },
+        index=dti,
+    )
+    m = df.resample("ME").sum() / 1e6
+    x = np.arange(12)
+    months = ["Jan", "Feb", "Mar", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Des"]
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    ax.bar(x, m["Wind"], 0.55, color=C["wind"], alpha=0.88,
+           label=f"Vind ({N_WIND_TURBINES}× Vestas V90-2.0 MW)")
+    ax.bar(x, m["Solar"], 0.55, bottom=m["Wind"], color=C["solar"], alpha=0.88,
+           label=f"Sol ({N_SOLAR_PANELS} paneler × {PANEL_RATED_WP} Wp)")
+    ax.plot(x, m["Demand"], "o-", color="#c62828", lw=2, ms=7, zorder=5, label="Totalt forbruk")
+
+    total = m["Wind"] + m["Solar"]
+    for i, (p, d) in enumerate(zip(total, m["Demand"])):
+        clr = "#a5d6a7" if p >= d else "#ef9a9a"
+        ax.bar(i, abs(p - d), 0.22, bottom=min(p, d), color=clr, alpha=0.6, zorder=4)
+        surplus = p - d
+        ax.text(i, p + 0.02,
+                f"+{surplus:.2f}" if surplus >= 0 else f"{surplus:.2f}",
+                ha="center", va="bottom", fontsize=7,
+                color="green" if surplus >= 0 else "red", fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(months)
+    ax.set_ylabel("Energi (GWh)")
+    ax.set_title(
+        f"Månedlig strømproduksjon vs. forbruk — Utsira G-Nexus\n"
+        f"Vind: {WIND_INSTALLED_MW:.1f} MW  |  Sol: {SOLAR_INSTALLED_MW*1000:.0f} kWp  |  "
+        f"Totalt: {WIND_INSTALLED_MW + SOLAR_INSTALLED_MW:.1f} MW",
+        fontsize=10,
+    )
+    ax.text(0.01, 0.97,
+            f"Årstotal:\n  Vind:    {m['Wind'].sum():.2f} GWh\n"
+            f"  Sol:     {m['Solar'].sum():.2f} GWh\n"
+            f"  Forbruk: {m['Demand'].sum():.2f} GWh\n"
+            f"  Overskudd: {(total - m['Demand']).sum():.2f} GWh",
+            transform=ax.transAxes, fontsize=8, va="top", fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+    handles, labels = ax.get_legend_handles_labels()
+    extra = [
+        Patch(color="#a5d6a7", alpha=0.6, label="Overskudd"),
+        Patch(color="#ef9a9a", alpha=0.6, label="Underskudd"),
+    ]
+    ax.legend(handles + extra, labels + [p.get_label() for p in extra], fontsize=8, loc="upper right")
+    plt.tight_layout()
+    plt.savefig("plots/fig_monthly_production.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig_monthly_production.png")
+
+
+def plot_signed_dispatch(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, battery_MWh, bat_charge_kW):
+    """Full-year signed dispatch — daily means, positive=gen, negative=load."""
+    df = pd.DataFrame(index=dti)
+    df["wind"]     = np.asarray(wind_kW)
+    df["solar"]    = np.asarray(solar_kW)
+    df["curt"]     = curtailed
+    df["private"]  = -(np.asarray(loads_dict["Residential"]) + np.asarray(loads_dict.get("EV charging", 0)))
+    df["industry"] = -(np.asarray(loads_dict.get("Salmon plant", 0)) + np.asarray(loads_dict.get("Water/sanitation", 0)))
+    df["business"] = -np.asarray(loads_dict.get("Business", 0))
+    df["dc_it"]    = -np.asarray(loads_dict.get("Data center", 0)) * 0.55
+    df["dc_cool"]  = -np.asarray(loads_dict.get("Data center", 0)) * 0.45
+    df["bat_chg"]  = -np.asarray(bat_charge_kW)
+    df["unmet"]    = deficit
+    d = df.resample("D").mean() / 1000
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    ax.stackplot(d.index, d["wind"], d["solar"], d["curt"],
+                 labels=["Wind", "PV", "Curtailed"],
+                 colors=[C["wind"], C["solar"], C["curt_wind"]], alpha=0.85)
+    ax.stackplot(d.index, d["private"], d["industry"], d["business"],
+                 d["dc_it"], d["dc_cool"], d["bat_chg"],
+                 labels=["Private (res+EV)", "Industry", "Business", "DC IT", "DC cooling", "Bat charge"],
+                 colors=[C["private"], C["industry"], C["business"], C["dc_it"], C["dc_cool"], C["bat_chg"]],
+                 alpha=0.85)
+    ax.plot(d.index, -d["unmet"], color=C["unmet"], lw=1.2, ls="--", label="Unmet load")
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_ylabel("Power (MW)")
+    ax.set_title("Full-Year Signed Power Dispatch\nPositive: generation  |  Negative: loads", fontsize=10)
+    ax.legend(loc="upper right", fontsize=7, ncol=5, framealpha=0.7)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig("plots/fig6_annual_signed_dispatch.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig6_annual_signed_dispatch.png")
+
+
+def _week_panel(ax_s, ax_d, ax_soc, t, ld, w, s, bd, chg, cur, dfc, soc, bat_MWh, label):
+    """Draw supply / demand / SoC panels for one week."""
+    tot_dem = sum(ld.values())
+    tot_sup = w + s + bd
+
+    ax_s.stackplot(t, w / 1000, s / 1000, bd / 1000, cur / 1000,
+                   labels=["Wind", "PV", "Battery discharge", "Curtailed"],
+                   colors=[C["wind"], C["solar"], C["bat_dis"], C["curt_wind"]], alpha=0.85)
+    ax_s.plot(t, tot_dem / 1000, "k--", lw=1.2, label="Total demand")
+    if dfc.sum() > 0:
+        ax_s.fill_between(t, tot_sup / 1000, tot_dem / 1000,
+                          where=(tot_dem > tot_sup), color=C["unmet"], alpha=0.4, label="Unmet")
+    ax_s.set_ylabel("Power (MW)")
+    ax_s.set_title(f"Representative {label} Week", fontsize=9)
+    ax_s.legend(fontsize=6, loc="upper right", ncol=2)
+    ax_s.set_ylim(bottom=0)
+
+    ax_d.stackplot(t,
+                   ld.get("Residential", 0) / 1000,
+                   ld.get("EV charging", 0) / 1000,
+                   ld.get("Business", 0) / 1000,
+                   (ld.get("Salmon plant", 0) + ld.get("Water/sanitation", 0)) / 1000,
+                   ld.get("Data center", 0) * 0.55 / 1000,
+                   ld.get("Data center", 0) * 0.45 / 1000,
+                   chg / 1000,
+                   labels=["Private", "EV", "Business", "Industry", "DC IT", "DC cooling", "Bat chg"],
+                   colors=[C["private"], C["ev"], C["business"], C["industry"],
+                           C["dc_it"], C["dc_cool"], C["bat_chg"]], alpha=0.85)
+    ax_d.plot(t, tot_dem / 1000, "k--", lw=1, label="Total demand")
+    ax_d.set_ylabel("Power (MW)")
+    ax_d.legend(fontsize=6, loc="upper right", ncol=3)
+    ax_d.set_ylim(bottom=0)
+
+    soc_pct = soc / bat_MWh * 100
+    ax_soc.fill_between(t, soc_pct, color="#a5d6a7", alpha=0.7)
+    ax_soc.plot(t, soc_pct, color="green", lw=1, label="SoC (%)")
+    ax_soc.axhline(100, color="red", ls="--", lw=0.8, label="Full")
+    ax_soc.axhline(20, color="orange", ls="--", lw=0.8, label="Min 20%")
+    ax_soc.set_ylim(0, 110)
+    ax_soc.set_ylabel("SoC (%)")
+    ax_soc.legend(fontsize=6, loc="upper right")
+
+
+def _day_axis(ax, t):
+    """Apply day-of-week x-axis ticks to an axes."""
+    ax.xaxis.set_major_locator(mdates.DayLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%a\n%d %b"))
+    ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
+    ax.tick_params(axis="x", which="major", labelsize=8)
+    ax.grid(axis="x", which="major", lw=0.5, alpha=0.5)
+    ax.grid(axis="x", which="minor", lw=0.3, alpha=0.3, ls=":")
+    ax.set_xlim(t[0], t[-1])
+
+
+def _get_week_data(dti, loads_dict, wind_kW, solar_kW,
+                   soc_MWh, curtailed, deficit, bat_charge_kW, start):
+    """Slice all arrays to a 7-day window starting at `start`."""
+    mask = (dti >= start) & (dti < start + pd.Timedelta(days=7))
+    t = dti[mask]
+    ld = {k: v[mask] for k, v in loads_dict.items()}
+    w = np.asarray(wind_kW)[mask]
+    s = np.asarray(solar_kW)[mask]
+    soc = soc_MWh[mask]
+    cur = curtailed[mask]
+    dfc = deficit[mask]
+    chg = bat_charge_kW[mask]
+    bd = np.clip(sum(v for v in ld.values()) - w - s, 0, None)
+    return t, ld, w, s, bd, chg, cur, dfc, soc
+
+
+def plot_seasonal_weeks(dti, loads_dict, wind_kW, solar_kW,
+                        soc_MWh, curtailed, deficit, bat_charge_kW, battery_MWh):
+    """One figure per season + combined 4-row overview."""
+    yr = dti[0].year
+    seasons = {
+        "Winter": f"{yr}-01-13",
+        "Spring": f"{yr}-04-07",
+        "Summer": f"{yr}-07-07",
+        "Autumn": f"{yr}-10-06",
+    }
+
+    for season, date_str in seasons.items():
+        start = pd.Timestamp(date_str)
+        t, ld, w, s, bd, chg, cur, dfc, soc = _get_week_data(
+            dti, loads_dict, wind_kW, solar_kW, soc_MWh, curtailed, deficit, bat_charge_kW, start
+        )
+        if t.empty:
+            continue
+
+        fig, axes = plt.subplots(3, 1, figsize=(16, 11), sharex=True)
+        fig.suptitle(
+            f"Representative {season} Week  "
+            f"({start.strftime('%d %b')}–{(start + pd.Timedelta(days=6)).strftime('%d %b %Y')})",
+            fontsize=13, fontweight="bold",
+        )
+        _week_panel(axes[0], axes[1], axes[2], t, ld, w, s, bd, chg, cur, dfc, soc, battery_MWh, season)
+        for ax in axes:
+            _day_axis(ax, t)
+        plt.tight_layout(rect=[0, 0, 1, 0.995])
+        plt.savefig(f"plots/fig7_{season.lower()}_week.png", dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  ✓ Saved plots/fig7_{season.lower()}_week.png")
+
+    fig, axes = plt.subplots(4, 3, figsize=(22, 28))
+    fig.suptitle("Seasonal Weekly Dispatch — Final Design", fontsize=14, fontweight="bold")
+
+    for row, (season, date_str) in enumerate(seasons.items()):
+        start = pd.Timestamp(date_str)
+        t, ld, w, s, bd, chg, cur, dfc, soc = _get_week_data(
+            dti, loads_dict, wind_kW, solar_kW, soc_MWh, curtailed, deficit, bat_charge_kW, start
+        )
+        if t.empty:
+            continue
+        _week_panel(axes[row, 0], axes[row, 1], axes[row, 2],
+                    t, ld, w, s, bd, chg, cur, dfc, soc, battery_MWh, season)
+        for col in range(3):
+            _day_axis(axes[row, col], t)
+
+    plt.tight_layout(h_pad=3.5, w_pad=2.5)
+    plt.savefig("plots/fig7_seasonal_weeks.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  ✓ Saved plots/fig7_seasonal_weeks.png (combined)")
+
+
+def plot_worst_case_week(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, bat_charge_kW, battery_MWh, worst_start):
+    """3-panel Dunkelflaute worst-case week."""
+    t, ld, w, s, bd, chg, cur, dfc, soc = _get_week_data(
+        dti, loads_dict, wind_kW, solar_kW, soc_MWh, curtailed, deficit, bat_charge_kW, worst_start
+    )
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    _week_panel(
+        axes[0], axes[1], axes[2], t, ld, w, s, bd, chg, cur, dfc, soc,
+        battery_MWh, f"Worst Drought (Dunkelflaute) — {worst_start.strftime('%d %b')}"
+    )
+    fig.suptitle("Worst Renewable Drought Week", fontsize=11)
+    plt.tight_layout()
+    plt.savefig("plots/fig8_dunkelflaute_week.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig8_dunkelflaute_week.png")
+
+
+def plot_annual_soc(dti, soc_MWh, battery_MWh, bat_charge_kW):
+    """Annual battery SoC (%) with charge/discharge on secondary axis."""
+    soc_pct = pd.Series(soc_MWh / battery_MWh * 100, index=dti)
+    chg = pd.Series(bat_charge_kW / 1000, index=dti)
+    soc_d = soc_pct.resample("D").mean()
+    chg_d = chg.resample("D").mean()
+
+    fig, ax1 = plt.subplots(figsize=(16, 5))
+    ax2 = ax1.twinx()
+
+    ax1.fill_between(soc_d.index, soc_d, color="#a5d6a7", alpha=0.5)
+    ax1.plot(soc_d.index, soc_d, color="green", lw=1, label="SoC mean")
+    ax1.plot(soc_d.index,
+             soc_pct.resample("D").min().rolling(5, center=True).min(),
+             color="orange", lw=1, ls="--", label="SoC min (5-day)")
+    ax1.axhline(20, color="red", ls=":", lw=0.8, label="Min 20%")
+    ax1.set_ylabel("Battery SoC (%)", color="green")
+    ax1.set_ylim(0, 110)
+
+    ax2.bar(chg_d.index, chg_d.clip(lower=0), color="#7b1fa2", alpha=0.4, width=1, label="Charging")
+    ax2.bar(chg_d.index, chg_d.clip(upper=0), color="#ef6c00", alpha=0.4, width=1, label="Discharging")
+    ax2.set_ylabel("Charge / Discharge (MW)", color="#7b1fa2")
+
+    l1, n1 = ax1.get_legend_handles_labels()
+    l2, n2 = ax2.get_legend_handles_labels()
+    ax1.legend(l1 + l2, n1 + n2, fontsize=7, loc="upper right", ncol=3)
+    ax1.set_title("Battery State of Charge — Full Year", fontsize=11)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig("plots/fig9_annual_soc.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig9_annual_soc.png")
+
+
+def plot_pareto_frontier(demand_kW, weather_df, dti):
+    """
+    Køyr simuleringa for mange kombinasjonar av vindmøller og Megapack-einingar.
+    Plottar Pareto-frontier: Curtailment [GWh] vs Unmet demand [%].
+    """
+    print("  ↓ Køyrer Pareto-analyse (dette tek litt tid)...")
+
+    turbine_options  = [1, 2, 3, 4]
+    megapack_options = [2, 4, 6, 8, 10, 14]
+
+    # Fargar per antal turbinar
+    colors = {1: "#90caf9", 2: "#1565c0", 3: "#0d47a1", 4: "#01579b"}
+    markers = {2: "o", 4: "s", 6: "^", 8: "D", 10: "P", 14: "*"}
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+
+    best_point = None
+    best_served = -1
+
+    for n_turb in turbine_options:
+        # Rekn ut vindproduksjon for dette antal turbinar
+        scale = n_turb / N_WIND_TURBINES
+        wind_kW_scaled = wind_power_curve(weather_df["wind_100m"].values) * (n_turb / N_WIND_TURBINES) * (N_WIND_TURBINES)
+        # Bruk effektkurva direkte med riktig antal turbinar
+        vestas_kW = np.array(VESTAS_V90_KW)
+        wind_kW_n = np.clip(
+            np.interp(weather_df["wind_100m"].values, VESTAS_V90_MS, vestas_kW * n_turb),
+            0, n_turb * TURBINE_RATED_MW * 1000
+        )
+        solar_kW_arr = pv_power(weather_df["irradiance"].values, weather_df["temp_2m"].values)
+        supply = wind_kW_n + solar_kW_arr
+
+        for n_mp in megapack_options:
+            cap_MWh  = n_mp * MEGAPACK_CAPACITY_MWh
+            pow_kW   = n_mp * MEGAPACK_POWER_MW * 1000
+            net      = supply - demand_kW.values
+            _, curt, deficit = simulate_battery(net, cap_MWh, pow_kW)
+
+            total_demand  = demand_kW.values.sum()
+            unmet_pct     = 100 * deficit.sum() / total_demand
+            curt_GWh      = curt.sum() / 1e6
+            served_pct    = 100 - unmet_pct
+
+            label = f"{n_turb} turbin{'ar' if n_turb>1 else ''}"
+            sc = ax.scatter(
+                curt_GWh, unmet_pct,
+                color=colors[n_turb],
+                marker=markers[n_mp],
+                s=120 + n_mp * 8,
+                alpha=0.85,
+                zorder=5,
+            )
+
+            # Annotér Megapack-tal
+            ax.annotate(
+                f"{n_mp}×MP",
+                (curt_GWh, unmet_pct),
+                textcoords="offset points",
+                xytext=(6, 4),
+                fontsize=6.5,
+                color=colors[n_turb],
+            )
+
+            if served_pct > best_served:
+                best_served = served_pct
+                best_point  = (curt_GWh, unmet_pct, served_pct)
+
+    # Markér beste punkt
+    if best_point:
+        ax.annotate(
+            f"Best\n{best_point[2]:.1f}% served",
+            (best_point[0], best_point[1]),
+            xytext=(15, -25), textcoords="offset points",
+            fontsize=8, color="green", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9", alpha=0.9),
+            arrowprops=dict(arrowstyle="->", color="green"),
+        )
+
+    # Legg til 1%-linje for unmet demand
+    ax.axhline(1, color="red", ls="--", lw=1, label="1% unmet (mål)", zorder=3)
+    ax.fill_between(ax.get_xlim(), 0, 1, color="green", alpha=0.07)
+
+    # Legende for turbinar
+    from matplotlib.lines import Line2D
+    turb_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=colors[n],
+               markersize=10, label=f"{n} vindmølle{'r' if n>1 else ''} ({n*TURBINE_RATED_MW:.0f} MW)")
+        for n in turbine_options
+    ]
+    mp_handles = [
+        Line2D([0], [0], marker=markers[n], color="grey",
+               markersize=8, label=f"{n}× Megapack ({n*MEGAPACK_CAPACITY_MWh:.0f} MWh)")
+        for n in megapack_options
+    ]
+    ax.legend(handles=turb_handles + mp_handles, fontsize=7.5,
+              loc="upper right", ncol=2, framealpha=0.85)
+
+    ax.set_xlabel("Total curtailment [GWh]", fontsize=11)
+    ax.set_ylabel("Unmet demand [%]", fontsize=11)
+    ax.set_title(
+        "Efficiency Frontier: Curtailment vs. Unmet Demand\n"
+        "(ideelt punkt = nedre venstre hjørne)",
+        fontsize=11
+    )
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("plots/fig_pareto_frontier.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig_pareto_frontier.png")
+
+
+def plot_generation_profiles(dti, wind_kW, solar_kW):
+    """Wind and solar generation profiles side by side."""
+    wind_d  = pd.Series(np.asarray(wind_kW) / 1000, index=dti).resample("D").mean()
+    solar_d = pd.Series(np.asarray(solar_kW) / 1000, index=dti).resample("D").sum() * 24
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+    ax1.bar(wind_d.index,  wind_d,  color=C["wind"],  alpha=0.7, width=1)
+    ax1.set_ylabel("Power (MW)")
+    ax1.set_title(f"Wind — {WIND_INSTALLED_MW} MW")
+
+    ax2.bar(solar_d.index, solar_d, color=C["solar"], alpha=0.8, width=1)
+    ax2.set_ylabel("Daily Energy (MWh)")
+    ax2.set_title(f"Solar PV — {SOLAR_INSTALLED_MW*1000:.0f} kWp")
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig("plots/fig11_generation_profiles.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved plots/fig11_generation_profiles.png")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    print("\n" + "=" * 65)
+    print("  G-Nexus Utsira — Hourly Energy Simulation")
+    print("=" * 65)
+
+    dti = pd.date_range(f"{SIM_YEAR}-01-01", periods=8760, freq="h")
+
+    # ── Demand ────────────────────────────────────────────────────────────────
+    print("\n[1/4] Building demand profiles...")
+    elhub_df    = fetch_elhub_consumption()
+    elhub_loads = elhub_to_hourly_loads(elhub_df, dti)
+
+    if elhub_loads is None:
+        raise RuntimeError(
+            "\n\n  ✗ Elhub-data er ikkje tilgjengeleg.\n"
+            "    Sjekk internettforbindelsen din og prøv igjen.\n"
+            "    Viss problemet vedvarar kan Elhub-tenesta vera nede:\n"
+            "    https://data.elhub.no\n"
+        )
+
+    print("  ✓ Using Elhub real consumption data for residential + business")
+    res_kW = elhub_loads["residential_kW"]
+
+    # Hypothetical loads from assignment spec — always use config parameters
+    salmon_kW = pd.Series(build_salmon_load(dti), index=dti)
+    water_kW  = build_water_sanitation_load(dti)
+
+    ev_kW  = build_ev_load(dti)
+    biz_kW = elhub_loads["industry_kW"]
+    print("  ✓ Using Elhub business/industry data")
+    dc_kW  = load_data_center(dti)
+
+    demand_kW = res_kW + salmon_kW + water_kW + ev_kW + biz_kW + dc_kW
+    loads_dict = {
+        "Residential":    np.asarray(res_kW),
+        "Salmon plant":   np.asarray(salmon_kW),
+        "Water/sanitation": np.asarray(water_kW),
+        "EV charging":    np.asarray(ev_kW),
+        "Business":       np.asarray(biz_kW),
+        "Data center":    np.asarray(dc_kW),
+    }
+
+    # ── Supply ────────────────────────────────────────────────────────────────
+    print("[2/4] Fetching ERA5 weather & building generation profiles...")
+    weather_df = fetch_era5_weather()
+    wind_kW  = build_wind_generation(dti, weather_df)
+    solar_kW = build_solar_generation(dti, weather_df)
+    supply_kW = wind_kW + solar_kW
+
+    # ── Battery ───────────────────────────────────────────────────────────────
+    print("[3/4] Sizing battery & running dispatch...")
+    battery_MWh, max_power_kW = get_battery_specs()
+    net_kW = supply_kW.values - demand_kW.values
+    soc_MWh, curtailed, deficit = simulate_battery(net_kW, battery_MWh, max_power_kW)
+    bat_charge_kW = np.where(net_kW > 0, net_kW - curtailed, 0)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n" + "─" * 65)
+    print("  ANNUAL SUMMARY")
+    print("─" * 65)
+    for label, series in [
+        ("Total demand",   demand_kW),
+        ("  Residential",  res_kW),
+        ("  Salmon plant", salmon_kW),
+        ("  Water/sanit.", water_kW),
+        ("  EV charging",  ev_kW),
+        ("  Business",     biz_kW),
+        ("  Data center",  dc_kW),
+        ("Total supply",   supply_kW),
+        ("  Wind",         wind_kW),
+        ("  Solar",        solar_kW),
+    ]:
+        print(f"  {label:<22}: {np.asarray(series).sum()/1e6:7.2f} GWh")
+
+    total_demand_MWh  = demand_kW.sum() / 1e3
+    total_supply_MWh  = supply_kW.values.sum() / 1e3
+    unmet_MWh         = deficit.sum() / 1e3
+    served_MWh        = total_demand_MWh - unmet_MWh
+    served_pct        = 100 * served_MWh / total_demand_MWh
+    unmet_pct         = 100 * unmet_MWh  / total_demand_MWh
+    renewable_frac    = 100 * total_supply_MWh / total_demand_MWh
+    curt_MWh          = curtailed.sum() / 1e3
+
+    print(f"  Battery              : {N_MEGAPACKS}× Tesla Megapack 2XL")
+    print(f"  Battery capacity     : {battery_MWh:7.1f} MWh")
+    print(f"  Battery max power    : {max_power_kW/1000:7.1f} MW")
+    print("─" * 65)
+    print("  KEY PERFORMANCE INDICATORS")
+    print("─" * 65)
+    print(f"  {'Metric':<25}  {'Value':>15}")
+    print(f"  {'─'*25}  {'─'*15}")
+    print(f"  {'Total Load':<25}  {total_demand_MWh:>12.0f} MWh")
+    print(f"  {'Served Load':<25}  {served_MWh:>12.0f} MWh")
+    print(f"  {'Served Fraction':<25}  {served_pct:>14.2f}%")
+    print(f"  {'Unmet Load':<25}  {unmet_MWh:>9.0f} MWh  ({unmet_pct:.2f}%)")
+    print(f"  {'Renewable Fraction':<25}  {renewable_frac:>14.1f}%")
+    print(f"  {'Curtailment':<25}  {curt_MWh:>12.0f} MWh")
+    print(f"  {'Peak demand':<25}  {demand_kW.max()/1000:>13.2f} MW")
+    print("─" * 65)
+
+    if unmet_pct > 1.0:
+        print("  ⚠  Unmet demand > 1%. Vurder fleire turbinar eller batteri.")
+    else:
+        print("  ✓  System dekkjer > 99% av etterspurnaden.")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    print("\n[4/4] Generating plots...")
+    plot_monthly_production(dti, wind_kW, solar_kW, demand_kW)
+    plot_signed_dispatch(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, battery_MWh, bat_charge_kW)
+    plot_seasonal_weeks(dti, loads_dict, wind_kW, solar_kW,
+                        soc_MWh, curtailed, deficit, bat_charge_kW, battery_MWh)
+
+    rolling = pd.Series(supply_kW.values).rolling(48).sum()
+    worst_start = dti[max(0, int(rolling.idxmin()) - 48)]
+
+    plot_worst_case_week(dti, loads_dict, wind_kW, solar_kW,
+                         soc_MWh, curtailed, deficit, bat_charge_kW, battery_MWh, worst_start)
+    plot_annual_soc(dti, soc_MWh, battery_MWh, bat_charge_kW)
+    plot_generation_profiles(dti, wind_kW, solar_kW)
+    plot_pareto_frontier(demand_kW, weather_df, dti)
+
+    print("\n  All done! Check the 'plots/' folder.\n")
+
+
+if __name__ == "__main__":
+    main()
